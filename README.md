@@ -21,11 +21,15 @@
 ## The Crew
 
 ```
-Planner      →  Breaks your request into subtasks       (Phi-3 Mini)
-Researcher   →  Searches your local docs via RAG        (Phi-3 Mini)
-Writer       →  Drafts emails, summaries, task lists    (Llama 3.2 3B)
-Reviewer     →  Checks quality · waits for YOUR OK      (Phi-3 Mini)
+Planner      →  Breaks your request into subtasks             (Phi-3 Mini)
+Researcher   →  Searches your local docs via RAG              (Phi-3 Mini)
+Writer       →  Drafts emails, summaries, task lists          (Llama 3.2 3B)
+SWE          →  Writes, refactors and debugs code             (Mistral 7B Q4)
+Tester       →  Generates test cases, validates SWE output    (Llama 3.2 3B)
+Reviewer     →  Checks quality · waits for YOUR OK            (Phi-3 Mini)
 ```
+
+The SWE and Tester agents work as a tight inner loop — SWE writes the code, Tester validates it, and they iterate before anything reaches the Reviewer. This keeps bugs from ever reaching your approval gate.
 
 ---
 
@@ -39,6 +43,9 @@ Drop a PDF into the watched folder. LlamaIndex indexes it automatically. Ask que
 
 ### 3 · Draft & Send
 Give a rough instruction. Writer drafts it. Reviewer grades tone and clarity. **Nothing goes out without your explicit sign-off.**
+
+### 4 · Code Generation & Test
+Describe a feature or bug fix in plain language. SWE writes the implementation, Tester generates unit tests and runs them in a Docker sandbox, they iterate until tests pass, then Reviewer presents the verified code for your approval before anything touches your actual codebase.
 
 ---
 
@@ -82,8 +89,9 @@ from crewai import Agent, Task, Crew
 from langchain_community.llms import Ollama
 
 # Point CrewAI at your local Ollama instance
-llm_small = Ollama(model="phi3:mini",    base_url="http://localhost:11434")
-llm_write = Ollama(model="llama3.2:3b", base_url="http://localhost:11434")
+llm_small  = Ollama(model="phi3:mini",      base_url="http://localhost:11434")
+llm_write  = Ollama(model="llama3.2:3b",   base_url="http://localhost:11434")
+llm_code   = Ollama(model="mistral:7b-q4", base_url="http://localhost:11434")
 
 planner = Agent(
     role="Planner",
@@ -92,15 +100,33 @@ planner = Agent(
     llm=llm_small
 )
 
-writer = Agent(
-    role="Writer",
-    goal="Produce clear, concise written output",
-    backstory="You are a skilled professional writer.",
-    llm=llm_write
+swe = Agent(
+    role="Software Engineer",
+    goal="Write clean, working code based on the task spec",
+    backstory="You are a senior software engineer who writes minimal, readable code.",
+    llm=llm_code,
+    allow_code_execution=True,
+    code_execution_mode="safe"   # runs inside Docker sandbox
+)
+
+tester = Agent(
+    role="Tester",
+    goal="Write unit tests for the SWE's code and validate they pass",
+    backstory="You are a QA engineer obsessed with edge cases and clean test coverage.",
+    llm=llm_write,
+    allow_code_execution=True,
+    code_execution_mode="safe"
+)
+
+reviewer = Agent(
+    role="Reviewer",
+    goal="Review final output and flag anything needing human approval",
+    backstory="You are a senior reviewer who only passes work that meets the bar.",
+    llm=llm_small
 )
 
 crew = Crew(
-    agents=[planner, writer],
+    agents=[planner, swe, tester, reviewer],
     tasks=[...],
     process="sequential"
 )
@@ -118,13 +144,18 @@ desk-crew/
 │   ├── planner.py
 │   ├── researcher.py
 │   ├── writer.py
+│   ├── swe.py              # Software Engineer agent
+│   ├── tester.py           # Test generation & validation agent
 │   └── reviewer.py
 ├── workflows/
 │   ├── morning_briefing.py
 │   ├── document_qa.py
-│   └── draft_and_send.py
+│   ├── draft_and_send.py
+│   └── code_and_test.py    # SWE + Tester inner loop workflow
 ├── rag/
 │   └── indexer.py          # LlamaIndex setup, watched folder logic
+├── sandbox/
+│   └── docker_runner.py    # Safe code execution environment
 ├── ui/
 │   └── app.py              # Gradio human-in-the-loop interface
 ├── observability/
@@ -146,17 +177,18 @@ desk-crew/
 | 1 | Ollama + CrewAI talking | Multi-agent handoff, basic plumbing |
 | 2 | Add LlamaIndex | RAG over your own documents |
 | 3 | Human-in-the-loop UI | Approval gates with Gradio |
-| 4 | Wrap AgentIQ | Profiling, latency tuning, token optimisation |
+| 4 | Add SWE + Tester agents | Code generation, sandboxed test execution, inner-loop iteration |
+| 5 | Wrap AgentIQ | Profiling, latency tuning, token optimisation across all 6 agents |
 
 ---
 
 ## Hardware Tips
 
-- **Keep models warm** — `OLLAMA_MAX_LOADED_MODELS=2` prevents cold-load latency between agent calls
+- **Keep models warm** — `OLLAMA_MAX_LOADED_MODELS=3` to keep Phi-3, Llama 3.2, and Mistral loaded simultaneously
 - **Use NVMe for vector store** — store the LlamaIndex index on SSD, not eMMC
 - **Start small** — `num_ctx=2048` per agent until you've profiled your baseline
-- **Crew size** — 2–3 agents for weeks 1–2, add the 4th once the pipeline is stable
-- **Code execution** — if any agent runs code, use `code_execution_mode: safe` (Docker sandbox)
+- **Crew size** — build up to 6 agents gradually across the weekly milestones, not all at once
+- **SWE + Tester sandbox** — always use `code_execution_mode: safe` (Docker) — never let agents run code outside the sandbox on your Jetson
 
 ---
 
@@ -165,8 +197,8 @@ desk-crew/
 | Need | Model | Why |
 |---|---|---|
 | Fast reasoning (Planner/Reviewer) | `phi3:mini` | Low memory, good instruction following |
-| Writing quality | `llama3.2:3b` | Better prose, fits in 8 GB alongside Phi-3 |
-| Better reasoning (if you can wait) | `mistral:7b-q4` | Noticeably smarter, slower inference |
+| Writing quality (Writer/Tester) | `llama3.2:3b` | Better prose and test generation, fits alongside Phi-3 |
+| Code generation (SWE) | `mistral:7b-q4` | Noticeably stronger at code, worth the slower inference |
 
 ---
 
